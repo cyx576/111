@@ -16,13 +16,12 @@ class ContrastiveLoss(nn.Module):
         label: Ground truth matrix (1 for positive pairs, 0 for negative pairs).
         """
         
-        # 1. Calculate squared Euclidean distance: d_sq = 2 * (1 - score)
-        # 确保使用浮点数 1.0，并使用 torch.clamp(min=0) 处理浮点误差，防止出现负数。
+        # 1. Calculate squared Euclidean distance
+        # 建议在这里就加上 1e-9，或者在 sqrt 里面加
         dis_sq = torch.clamp(2.0 * (1.0 - score), min=0)
         
-        # 2. Calculate un-squared Euclidean distance: d = sqrt(d_sq)
-        # dis 现在是一个 Tensor，解决了 'int' 类型的错误。
-        dis = torch.sqrt(dis_sq)
+        # 2. 【修复】: 加上 1e-9 防止对 0 开根号导致梯度爆炸
+        dis = torch.sqrt(dis_sq + 1e-9)
         
         # 3. 计算正样本损失 (Positive Loss): 
         # L_pos = label * d^2 (我们希望正样本距离小)

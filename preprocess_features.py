@@ -149,9 +149,47 @@ def generate_image_features(ent_map, output_name):
     pbar = tqdm(entity_list_to_process, desc=f"Extracting {output_name}")
     
     for i, ent_name in enumerate(pbar):  # ent_name 现在是 CLEANED key
-        img_folder_id = ent_map[ent_name]
+        # === 核心修复：智能路径解析 ===
+        
         entity_embeddings = []
+        
+        # 1. 默认策略：优先使用映射文件中的值 (DB15K 通常在这里存了正确的文件夹名)
+        img_folder_id = ent_map.get(ent_name, ent_name)
+        
+        # 2. FB15K 特殊处理 (Freebase ID)
+        # 映射文件通常给的是 /m/xxx，但文件夹是 m.xxx
+        if ent_name.startswith("/m/"):
+            img_folder_id = ent_name[1:].replace("/", ".")
+        
+        # 3. DB15K 补充处理 (DBpedia URI)
+        # 如果默认映射的路径不存在，尝试从 URI 中提取名称
+        # 例如 <http://dbpedia.org/resource/Carol_Reed> -> Carol_Reed
         entity_folder = os.path.join(IMG_ROOT_DIR, img_folder_id)
+        
+        if not os.path.exists(entity_folder) and ent_name.startswith("<"):
+            # 尝试提取 URI 的最后一部分作为文件夹名
+            try:
+                # 去掉尖括号，按 / 分割，取最后一个
+                potential_name = ent_name.strip("<>").split("/")[-1]
+                
+                # 有些名字可能有 URL 编码 (如 %20)，尝试解码
+                import urllib.parse
+                decoded_name = urllib.parse.unquote(potential_name)
+                
+                # 检查这两种可能性
+                if os.path.exists(os.path.join(IMG_ROOT_DIR, potential_name)):
+                    img_folder_id = potential_name
+                    entity_folder = os.path.join(IMG_ROOT_DIR, potential_name)
+                elif os.path.exists(os.path.join(IMG_ROOT_DIR, decoded_name)):
+                    img_folder_id = decoded_name
+                    entity_folder = os.path.join(IMG_ROOT_DIR, decoded_name)
+            except:
+                pass
+        
+        # === 调试打印 (只打印前 5 个) ===
+        if i < 5:
+            status = "FOUND" if os.path.exists(entity_folder) else "MISSING"
+            print(f"[DEBUG] Entity: {ent_name} -> Folder: {img_folder_id} [{status}]")
         
         # 1. 查找文件夹内所有 .jpg 文件
         image_files = glob.glob(os.path.join(entity_folder, "*.jpg"))

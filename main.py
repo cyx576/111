@@ -7,20 +7,12 @@ import math
 import numpy as np
 import random
 from kgs import *
-import model
 from model import *
 # import tmea_model_v2    # <--- 新增：导入新的模块对象
 # from tmea_model_v2 import * # <--- 新增：导入所有符号
 from utils import *
 from evaluation import *
 from loss import *
-
-# ------------------ 【模块重载修复】 ------------------
-import importlib
-# 假设 model.py 被导入为 model
-importlib.reload(model)
-# ----------------------------------------------------
-
 
 def load_args(file):
     with open(file, 'r') as f:
@@ -158,6 +150,14 @@ def train(model, kgs, args, out_folder):
                                                                                                         label_) + align_criterion(
                 ims, label_)
             loss = r_loss + align_loss + orth_loss + mmd_loss
+            
+            # 在 main.py 的 loss.backward() 之前加入调试代码
+            if torch.isnan(loss):
+                print("Loss is NaN! Stopping training.")
+                print("r_loss:", r_loss.item())
+                print("mmd_loss:", mmd_loss.item())
+                # 这里可以打印更多信息来定位
+                break
             loss.backward()
             
             # ------------------ 【核心修复】: 梯度钳制 ------------------
@@ -178,49 +178,56 @@ def train(model, kgs, args, out_folder):
             sup_align_steps = int(math.ceil(len(new_e1) / args.e_batch_size))
             optimizer.zero_grad()
             sup_align_loss = 0
+            
             for ind in range(sup_align_steps):
                 start_ = ind * args.e_batch_size
                 end_ = (ind + 1) * args.e_batch_size
-                print(start_, end_)
+                print(f"Supervised Align Batch: {start_} -> {end_}")
                 
-                train_e1 = torch.LongTensor(new_e1[start_:end_]).cuda()
-                train_e2 = torch.LongTensor(new_e2[start_:end_]).cuda()
+                # 【关键修复 1】: 重命名变量，不要使用 train_e1/train_e2，防止覆盖全局变量
+                sup_e1 = torch.LongTensor(new_e1[start_:end_]).cuda()
+                sup_e2 = torch.LongTensor(new_e2[start_:end_]).cuda()
                 
                 at_mask1 = torch.ByteTensor([kgs.attr_mask[x] for x in new_e1[start_:end_]]).cuda()
                 at_mask2 = torch.ByteTensor([kgs.attr_mask[x] for x in new_e2[start_:end_]]).cuda()
                 im_mask1 = torch.ByteTensor([kgs.image_mask[x] for x in new_e1[start_:end_]]).cuda()
                 im_mask2 = torch.ByteTensor([kgs.image_mask[x] for x in new_e2[start_:end_]]).cuda()
                 
+                # 使用当前的 batch size 创建 label
                 label_ = torch.eye(len(new_e1[start_:end_])).cuda()
                 
-                rs, ats, ims, score, _, _ = model.predict(train_e1, train_e2, at_mask1, im_mask1, at_mask2, im_mask2,
+                # 使用 sup_e1, sup_e2 进行预测
+                rs, ats, ims, score, _, _ = model.predict(sup_e1, sup_e2, at_mask1, im_mask1, at_mask2, im_mask2,
                                                           'train')
-                sup_align_loss += align_criterion(score, label_) + align_criterion(rs, label_) + align_criterion(ats,
-                                                                                                                 label_) + align_criterion(
-                    ims, label_)
+                sup_align_loss += align_criterion(score, label_) + align_criterion(rs, label_) + \
+                                  align_criterion(ats, label_) + align_criterion(ims, label_)
             
             sup_align_loss *= 0.1
             sup_align_loss.backward()
             optimizer.step()
             epoch_sup_celoss += sup_align_loss.item()
         
-        epoch_rloss /= trained_samples_num
+        # 【修复 2】: 你的除零保护逻辑 (正确)
+        if trained_samples_num > 0:
+            epoch_rloss /= trained_samples_num
+        else:
+            epoch_rloss = 0.0
         
-        # <<<--- 最终修复 ZeroDivisionError: 统一检查 len(train_e1) --->>>
+        # 【修复 3】: 你的除零保护逻辑 (正确)
+        # 注意：由于我们上面改用了 sup_e1，这里的 train_e1 依然保持是全量训练数据，长度正确
         if len(train_e1) > 0:
             epoch_celoss /= len(train_e1)
             epoch_orth_loss /= len(train_e1)
             epoch_mmd_loss /= len(train_e1)
         else:
-            # 警告信息，避免除以零
             print("警告: 训练实体列表 train_e1 为空。跳过对齐损失平均化。")
             epoch_celoss = 0.0
             epoch_orth_loss = 0.0
             epoch_mmd_loss = 0.0
-        # <<<--- 修复结束 --->>>
         
         if args.iterative and new_e1:
             epoch_sup_celoss /= len(new_e1)
+        
         epoch_loss = epoch_rloss + epoch_celoss + epoch_sup_celoss + epoch_orth_loss + epoch_mmd_loss
         
         random.shuffle(kgs.relation_triples_list1)

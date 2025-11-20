@@ -54,9 +54,8 @@ class CrossAttention(nn.Module):
 
 class VAE(nn.Module):
     # def __init__(self, input_dim, latent_dim, enc_layers, dec_layers):
-    def __init__(self, input_dim, latent_dim, enc_layers, dec_layers, name="Unknown"):  # 加
+    def __init__(self, input_dim, latent_dim, enc_layers, dec_layers):  # 加
         super(VAE, self).__init__()
-        self.name = name  # 保存 VAE 的名字（加）
         
         self.input_dim = input_dim
         self.latent_dim = latent_dim
@@ -122,22 +121,6 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         z = mu + eps * std
         
-        # ------------------ 【Z 向量数值检查 - 调试代码】 ------------------
-        # 使用 getattr 安全获取名称，避免 [Unknown] 导致崩溃
-        display_name = getattr(self, 'name', 'VAE (Naming Failed)')
-        
-        if torch.isnan(z).any() or torch.isinf(z).any():
-            print(f"🚨🚨🚨 ALERT: VAE [{display_name}] 潜变量 Z 包含 NaN/Inf 🚨🚨🚨")
-            print(f"  Z (max/min): {z.max().item():.2f} / {z.min().item():.2f}")
-            print(f"  mu (max/min): {mu.max().item():.2f} / {mu.min().item():.2f}")
-            print(f"  logvar (max/min): {logvar.max().item():.2f} / {logvar.min().item():.2f}")
-            variance = std.pow(2)
-            print(f"  Variance (max/min): {variance.max().item():.2e} / {variance.min().item():.2e}")
-        
-        if z.max() > 1000 or z.min() < -1000:
-            print(f"💥💥💥 ALERT: VAE [{display_name}] Z 幅度爆炸! Max: {z.max().item():.2f}")
-        # --------------------------------------------------------------------
-        
         # ------------------ 【核心修复 2】: 钳制 Z ------------------
         # 即使 logvar 被钳制，Z 也应该被钳制以防万一。
         z = torch.clamp(z, min=-10.0, max=10.0)
@@ -188,13 +171,13 @@ class TMEA(nn.Module):
         self.kgs = kgs
         self.args = args
         
-        # ------------------ 【新增 VAE 名称】 ------------------
-        self.ir_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="IR_VAE")
-        self.ar_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="AR_VAE")
-        
-        self.a_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="A_VAE")
-        self.i_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="I_VAE")
-        # ----------------------------------------------------
+        # # ------------------ 【新增 VAE 名称】 ------------------
+        # self.ir_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="IR_VAE")
+        # self.ar_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="AR_VAE")
+        #
+        # self.a_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="A_VAE")
+        # self.i_vae = VAE(input_dim=self.args.dim, latent_dim=64, enc_layers=2, dec_layers=2, name="I_VAE")
+        # # ----------------------------------------------------
         
         self.hidden_size = args.dim
         self.modal_weight = nn.Parameter(
@@ -305,80 +288,70 @@ class TMEA(nn.Module):
         return F.normalize(self.fc_a(self.atr_embed(e)), 2, -1)
     
     def gene_loss(self, recon_output, original_output, mu, logvar):
+        # 1. 计算重构损失 (MSE)
         recon_loss = nn.MSELoss()(recon_output, original_output)
         
-        # kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        # ------------------ 【重新启用修复 2】: 钳制方差防止 log(0) ------------------
-        # 确保方差不会下溢到 0，导致 log(0) -> -Inf
-        variance = logvar.exp().clamp(min=1e-8)
-        # KL Divergence
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - variance)
-        #-----
+        # 2. 【修复】限制 logvar 的范围，防止 exp() 溢出导致 Inf
+        # 将 logvar 限制在 [-10, 10] 范围内是 VAE 的常用技巧
+        logvar = torch.clamp(logvar, min=-10, max=10)
+        
+        # 3. 计算 KL 散度
+        # 公式: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        
+        # 如果需要更安全的除法（归一化到 batch），可以除以样本数，但原论文似乎是直接求和
+        # 这里保持原逻辑，只修复数值稳定性
+        
         return recon_loss + kl_loss
     
     def miss_generation(self, e_r, e_i, e_a, a_mask, i_mask):
+        # 分离梯度，避免影响编码器
         with torch.no_grad():
             mask_row = a_mask * i_mask
             e_i_detach = e_i.detach()
             e_a_detach = e_a.detach()
             e_r_detach = e_r.detach()
-            
-        # ------------------ 【新增代码】: 检查原始输入 Embeddings ------------------
-        # 打印原始嵌入的最大值，如果它是 Inf 或 NaN，就会在这里被标记
-        if torch.isnan(e_r_detach).any() or torch.isinf(e_r_detach).any():
-            print(f"🔴🔴🔴 CRITICAL: e_r (Relation Embeddings) is contaminated! Max: {e_r_detach.max().item():.2f}")
-        if torch.isnan(e_i_detach).any() or torch.isinf(e_i_detach).any():
-            print(f"🔴🔴🔴 CRITICAL: e_i (Image Embeddings) is contaminated! Max: {e_i_detach.max().item():.2f}")
-        if torch.isnan(e_a_detach).any() or torch.isinf(e_a_detach).any():
-            print(f"🔴🔴🔴 CRITICAL: e_a (Attribute Embeddings) is contaminated! Max: {e_a_detach.max().item():.2f}")
-        # -------------------------------------------------------------------------
         
-        # 检查是否有数据可以用于 VAE
-        if e_r_detach.numel() == 0:
-            return 0, e_a_detach, e_i_detach
+        # 【修复】如果当前 batch 中没有同时具备两种模态的实体，直接返回 0 损失
+        # 避免 MSELoss 对空 Tensor 计算得到 NaN
+        if mask_row.sum() == 0:
+            zero_loss = torch.tensor(0.0, device=e_r.device, requires_grad=True)
+            return zero_loss, e_a, e_i
         
+        # VAE 的输入映射
         ir_input = self.fc_map_1(torch.cat((e_i_detach, e_r_detach), dim=-1))
         ar_input = self.fc_map_2(torch.cat((e_a_detach, e_r_detach), dim=-1))
         
-        # ------------------ 【新增代码】: 钳制 FC Map 输出 ------------------
-        # 钳制 FC 映射层的输出，防止它们在进入 VAE 之前就爆炸
-        ir_input = torch.clamp(ir_input, min=-1e3, max=1e3)
-        ar_input = torch.clamp(ar_input, min=-1e3, max=1e3)
-        # ------------------------------------------------------------------
-        
-        # generate a with i and r
+        # VAE 前向传播
         gen_ir, ir_mu, ir_logvar, ir_latent = self.ir_vae(ir_input)
         gen_a, a_mu, a_logvar, a_latent = self.a_vae(e_a_detach)
         
         comp_a = self.a_vae.decode(ir_latent)
-        # generate i with a and r
+        
         gen_ar, ar_mu, ar_logvar, ar_latent = self.ar_vae(ar_input)
         gen_i, i_mu, i_logvar, i_latent = self.i_vae(e_i_detach)
         
         comp_i = self.i_vae.decode(ar_latent)
-        # optimize
-        mmd_loss = self.gene_loss(gen_a[mask_row.bool()], e_a_detach[mask_row.bool()], a_mu[mask_row.bool()],
-                                  a_logvar[mask_row.bool()]) + self.gene_loss(gen_ir[mask_row.bool()],
-                                                                              ir_input[mask_row.bool()],
-                                                                              ir_mu[mask_row.bool()], ir_logvar[
-                                                                                  mask_row.bool()]) + self.gene_loss(
-            gen_i[mask_row.bool()], e_i_detach[mask_row.bool()], i_mu[mask_row.bool()],
-            i_logvar[mask_row.bool()]) + self.gene_loss(gen_ar[mask_row.bool()], ar_input[mask_row.bool()],
-                                                        ar_mu[mask_row.bool()],
-                                                        ar_logvar[mask_row.bool()]) + self.mse_factor * nn.MSELoss()(
-            a_latent[mask_row.bool()], ir_latent[mask_row.bool()]) + self.mse_factor * nn.MSELoss()(
-            i_latent[mask_row.bool()], ar_latent[mask_row.bool()])
         
+        # 提取有效样本的 Mask
+        valid_mask = mask_row.bool()
+        
+        # 计算损失 (MMD Loss / VAE Loss)
+        # 注意：这里的 loss 计算只针对 valid_mask 为 True 的样本
+        loss_vae_a = self.gene_loss(gen_a[valid_mask], e_a_detach[valid_mask], a_mu[valid_mask], a_logvar[valid_mask])
+        loss_vae_ir = self.gene_loss(gen_ir[valid_mask], ir_input[valid_mask], ir_mu[valid_mask], ir_logvar[valid_mask])
+        loss_vae_i = self.gene_loss(gen_i[valid_mask], e_i_detach[valid_mask], i_mu[valid_mask], i_logvar[valid_mask])
+        loss_vae_ar = self.gene_loss(gen_ar[valid_mask], ar_input[valid_mask], ar_mu[valid_mask], ar_logvar[valid_mask])
+        
+        loss_align_a = nn.MSELoss()(a_latent[valid_mask], ir_latent[valid_mask])
+        loss_align_i = nn.MSELoss()(i_latent[valid_mask], ar_latent[valid_mask])
+        
+        mmd_loss = loss_vae_a + loss_vae_ir + loss_vae_i + loss_vae_ar + \
+                   self.mse_factor * (loss_align_a + loss_align_i)
+        
+        # 填充补全后的特征
         e_i_comp = torch.where(i_mask.unsqueeze(-1).bool(), e_i, comp_i)
         e_a_comp = torch.where(a_mask.unsqueeze(-1).bool(), e_a, comp_a)
-        
-        # ------------------ 【最终核心修复】: 钳制 TMEA 的所有参数值 ------------------
-        # 钳制所有需要梯度的参数的 *值* (param.data)，确保没有一个参数值逃逸到 NaN
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                # 限制在 -10.0 到 10.0 之间，这是安全的嵌入值域。
-                param.data = torch.clamp(param.data, min=-10.0, max=10.0)
-        # ----------------------------------------------------------------------------
         
         return mmd_loss, e_a_comp, e_i_comp
     
