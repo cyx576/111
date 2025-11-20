@@ -1,2 +1,2 @@
-# 111
-TMEA
+# [NeurIPS 2024] Tackling Uncertain Correspondences for Multi-Modal Entity Alignment
+Codes for the paper titled "Tackling Uncertain Correspondences for Multi-Modal Entity Alignment", published in Proceedings of the 38th Annual Conference on Neural Information Processing Systems (NeurIPS'2024).
